@@ -1,0 +1,19 @@
+{
+    "name": "com.polyphase.editor.levelbuilder.grid",
+    "author": "Polyphase Labs",
+    "description": "Uniform-grid placement tool on top of Polyphase Level Builder Core. Sibling to the modular addon.",
+    "displayName": "Polyphase Grid Level Builder",
+    "version": "0.1.0",
+    "dependencies": [
+        "com.polyphase.editor.levelbuilder.core"
+    ],
+    "native": {
+        "target": "engine",
+        "sourceDir": "Source",
+        "binaryName": "com.polyphase.editor.levelbuilder.grid",
+        "entrySymbol": "PolyphasePlugin_GetDesc",
+        "apiVersion": 3,
+        "resolveMode": "source",
+        "binaries": []
+    }
+}
