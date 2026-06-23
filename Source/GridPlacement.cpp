@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 
 #if EDITOR
 #include "imgui.h"
@@ -215,6 +216,7 @@ namespace
     // would otherwise happen with Paint's 60Hz tick re-feeding
     // dangling pointers.
     static void GridEnumeratePlacements(const LBVec3* center, float radius,
+                                         const char* sourceAssetFilter,
                                          LevelBuilderCoreAPI::LBVisitFn visit,
                                          void* visitUd,
                                          void* /*siblingUd*/)
@@ -223,22 +225,30 @@ namespace
         const float r2 = radius * radius;
         auto& reg = GridPlacedRegistry::Get();
 
-        std::vector<void*> hits;
+        // v11: optional source-asset filter.
+        const bool haveFilter = (sourceAssetFilter && *sourceAssetFilter);
+
+        // v12: also snapshot the asset alongside the node so the visitor
+        // can read it (Replace's eyedropper mode).
+        struct Hit { void* node; std::string asset; };
+        std::vector<Hit> hits;
         hits.reserve(16);
         for (int i = 0; i < reg.Count(); ++i)
         {
             const auto& p = reg.At(i);
             const float dx = p.worldPos.x - center->x;
             const float dz = p.worldPos.z - center->z;
-            if (dx*dx + dz*dz <= r2)
-                hits.push_back(p.node);
+            if (dx*dx + dz*dz > r2) continue;
+            if (haveFilter && p.assetName != sourceAssetFilter) continue;
+            hits.push_back({p.node, p.assetName});
         }
 
         PolyphaseEngineAPI* eng = nullptr;
-        for (void* node : hits)
+        for (const Hit& h : hits)
         {
+            void* node = h.node;
             if (!node) continue;
-            int consume = visit(node, visitUd);
+            int consume = visit(node, h.asset.c_str(), visitUd);
             if (consume != 1) continue;
 
             // Snapshot asset+pos+rot BEFORE registry removal — undo
@@ -314,6 +324,83 @@ void GridPlacedRegistry::RemoveByNode(void* node)
     {
         if (it->node == node) { mPieces.erase(it); return; }
     }
+}
+
+int GridPlacedRegistry::RebuildFromWorld()
+{
+    // Same pattern as modular's RebuildFromWorld — walk the scene tree,
+    // match StaticMesh3D nodes against the known asset-name set, register
+    // matches. Grid doesn't carry kit metadata on each piece, so we just
+    // need the asset-name set rather than a kit-name → piece-name map.
+    Clear();
+
+    LevelBuilderCoreAPI* api = CoreAPI();
+    if (!api) return 0;
+    PolyphaseEngineAPI* eng = EngineAPI();
+    if (!eng || !eng->GetWorld) return 0;
+
+    World* world = (World*)eng->GetWorld(0);
+    if (!world) return 0;
+    Node* root = world->GetRootNode();
+    if (!root) return 0;
+
+    // Set of asset names across all loaded kits.
+    std::unordered_set<std::string> knownAssets;
+    const int kitCount = api->Kit_GetCount ? api->Kit_GetCount() : 0;
+    for (int ki = 0; ki < kitCount; ++ki)
+    {
+        LBKitInfo k{};
+        if (!api->Kit_GetInfo || !api->Kit_GetInfo(ki, &k)) continue;
+        for (int pi = 0; pi < k.pieceCount; ++pi)
+        {
+            LBPieceInfo p{};
+            if (!api->Kit_GetPieceInfo || !api->Kit_GetPieceInfo(ki, pi, &p)) continue;
+            if (p.assetName && *p.assetName) knownAssets.insert(p.assetName);
+        }
+    }
+    if (knownAssets.empty()) return 0;
+
+    std::vector<Node*> stack;
+    stack.reserve(64);
+    stack.push_back(root);
+    int found = 0;
+    while (!stack.empty())
+    {
+        Node* n = stack.back();
+        stack.pop_back();
+        if (!n) continue;
+
+        const uint32_t kids = n->GetNumChildren();
+        for (uint32_t i = 0; i < kids; ++i)
+        {
+            if (Node* c = n->GetChild((int32_t)i))
+                stack.push_back(c);
+        }
+
+        if (!n->Is("StaticMesh3D")) continue;
+        StaticMesh3D* sm = (StaticMesh3D*)n;
+        StaticMesh* mesh = sm->GetStaticMesh();
+        if (!mesh) continue;
+        const std::string& assetName = mesh->GetName();
+        if (knownAssets.find(assetName) == knownAssets.end()) continue;
+
+        glm::vec3 wp = sm->GetWorldPosition();
+        glm::quat wr = sm->GetWorldRotationQuat();
+        Add((void*)n, assetName,
+            LBVec3{wp.x, wp.y, wp.z},
+            LBQuat{wr.x, wr.y, wr.z, wr.w});
+        ++found;
+    }
+
+    if (eng->LogDebug)
+    {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "[LevelBuilderGrid] RebuildFromWorld: re-registered %d placed piece(s)",
+                      found);
+        eng->LogDebug(buf);
+    }
+    return found;
 }
 
 // -----------------------------------------------------------------------------
@@ -479,9 +566,25 @@ namespace
     {
         auto* s = (GridUndoRecord*)p;
         if (!s->node) return;
+
+        // DEFENSIVE: see Modular_EnsureDead. If the node isn't in our
+        // placed registry, it was already destroyed via some other path
+        // (Replace, manual delete, engine destroy) — don't double-free.
+        auto& reg = GridPlacedRegistry::Get();
+        bool stillThere = false;
+        for (int i = 0; i < reg.Count(); ++i)
+        {
+            if (reg.At(i).node == s->node) { stillThere = true; break; }
+        }
+        if (!stillThere)
+        {
+            s->node = nullptr;
+            return;
+        }
+
         PolyphaseEngineAPI* eng = EngineAPI();
         if (eng && eng->DestroyNode) eng->DestroyNode((Node*)s->node);
-        GridPlacedRegistry::Get().RemoveByNode(s->node);
+        reg.RemoveByNode(s->node);
         s->node = nullptr;
     }
 }
@@ -701,6 +804,15 @@ void GridPlacement::Initialize()
                                  &GridEnumeratePlacements,
                                  nullptr);
     }
+
+    // v13: register the rebuild-from-world callback so core can rescan
+    // the scene on Level Builder mode activate.
+    if (api->RegisterRebuildFromWorldFn)
+    {
+        api->RegisterRebuildFromWorldFn("Grid Placement",
+            [](void* /*ud*/) { GridPlacedRegistry::Get().RebuildFromWorld(); },
+            nullptr);
+    }
     if (api->RegisterSpawnFn)
     {
         api->RegisterSpawnFn("Grid Placement",
@@ -730,6 +842,8 @@ void GridPlacement::Shutdown()
             api->UnregisterSpawnFn("Grid Placement");
         if (api->UnregisterEnumerateFn)
             api->UnregisterEnumerateFn("Grid Placement");
+        if (api->UnregisterRebuildFromWorldFn)
+            api->UnregisterRebuildFromWorldFn("Grid Placement");
         if (api->UnregisterToolViewportInput)
             api->UnregisterToolViewportInput("Grid Placement");
         api->UnregisterTool        ("Grid Placement");
@@ -823,12 +937,34 @@ void GridPlacement::PlaceFromPreview()
 // Fires when the user left-clicks inside the viewport while "Grid
 // Placement" is active. Core's per-frame raycast has already updated the
 // preview transform via GridSnapProvider; we just commit.
-static void GridPlacement_OnViewportClick(const LBVec3* /*hitPos*/,
+static void GridPlacement_OnViewportClick(const LBVec3* hitPos,
                                           const LBVec3* /*hitNormal*/,
                                           void*         /*hitNode*/,
                                           int           /*button*/,
                                           void*         /*userData*/)
 {
+    // If the active brush opts out of needing an armed palette item
+    // (Replace etc.), route the click directly through api->Place with
+    // the raw hit position — bypassing the PlaceFromPreview path which
+    // requires the palette/preview to be armed.
+    LevelBuilderCoreAPI* api = CoreAPI();
+    if (api && api->FindBrush && api->GetActiveBrushName)
+    {
+        const char* activeBrushName = api->GetActiveBrushName();
+        LevelBuilderBrush* activeBrush = activeBrushName ? api->FindBrush(activeBrushName) : nullptr;
+        if (activeBrush && !activeBrush->NeedsArmedPreview())
+        {
+            LevelBuilderPlacementRequest req{};
+            req.assetName  = "";
+            req.position   = hitPos ? *hitPos : LBVec3{0,0,0};
+            req.rotation   = LBQuat{0, 0, 0, 1};
+            req.scale      = LBVec3{1, 1, 1};
+            req.parentNode = nullptr;
+            if (api->Place) api->Place(&req);
+            return;
+        }
+    }
+
     GridPlacement::PlaceFromPreview();
 }
 

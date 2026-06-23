@@ -398,6 +398,25 @@ namespace
                                                 * (2 * (radius < 0 ? 0 : radius) + 1));
     }
 
+    // ---- Debug accordion contents — placed-registry inspect/manage. ----
+    // Mirrors modular's Debug controls so Paint Erase / Replace work
+    // against pieces loaded from disk (project save+reload) — call
+    // "Rebuild From World" once after opening the project and the
+    // placed registry repopulates from existing scene nodes.
+    void DrawDebugSection()
+    {
+        ImGui::Text("Placed pieces: %d", GridPlacedRegistry::Get().Count());
+        if (ImGui::Button("Clear Placed Registry"))
+            GridPlacedRegistry::Get().Clear();
+        ImGui::SameLine();
+        if (ImGui::Button("Rebuild From World"))
+            GridPlacedRegistry::Get().RebuildFromWorld();
+        ImGui::TextDisabled(
+            "Rebuild scans the current scene for nodes matching any kit "
+            "piece. Run after loading a project so Paint Erase / Replace "
+            "see pre-existing placements.");
+    }
+
     void DrawTab(void* /*userData*/)
     {
         GridUI::DrawSharedSections();
@@ -419,6 +438,7 @@ namespace GridUI
         if (ImGui::CollapsingHeader("Placement", kClosed)) DrawPlacementSection();
         if (ImGui::CollapsingHeader("Snap",      kClosed)) DrawSnapSection();
         if (ImGui::CollapsingHeader("Overlay",   kClosed)) DrawOverlaySection();
+        if (ImGui::CollapsingHeader("Debug",     kClosed)) DrawDebugSection();
     }
 
     void Register()

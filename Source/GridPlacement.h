@@ -37,6 +37,12 @@ public:
              const LBVec3& pos, const LBQuat& rot);
     void Clear();
     void RemoveByNode(void* node);
+
+    // Walk the active world and re-register every StaticMesh3D whose
+    // mesh matches a known kit-piece asset. Used to recover Paint
+    // Erase / Replace state across project save+load. Returns count.
+    int  RebuildFromWorld();
+
     int  Count() const { return (int)mPieces.size(); }
     const GridPlacedPiece& At(int i) const { return mPieces[i]; }
 
