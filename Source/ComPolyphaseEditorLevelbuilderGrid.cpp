@@ -28,6 +28,7 @@
 
 #if EDITOR
 #include "GridUI.h"
+#include "ThumbnailCache.h"
 #endif
 
 static PolyphaseEngineAPI* sEngineAPI = nullptr;
@@ -107,6 +108,7 @@ static void RegisterEditorUI(EditorUIHooks* hooks, uint64_t hookId)
 {
     sHooks  = hooks;
     sHookId = hookId;
+    ThumbnailCache::Bind(hooks);
     GridUI::Register();
     GridUI::RegisterViewportOverlay(hooks, hookId);
 }
